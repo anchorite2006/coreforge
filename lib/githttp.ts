@@ -188,6 +188,33 @@ function haveClosure(store: ObjectStore, haves: string[], clientShallow: Readonl
   return out;
 }
 
+/**
+ * Commits within `depth` BFS generations of `tip` (the tip is generation 0):
+ * exactly the set generations() reports below the depth cutoff, computed
+ * without walking the rest of the history — a depth-1 clone of a long
+ * history touches the tip alone instead of every commit in it.
+ */
+function commitsWithinDepth(store: ObjectStore, tip: string, depth: number): Set<string> {
+  const included = new Set<string>();
+  let frontier = [tip];
+  let level = 0;
+  while (frontier.length > 0 && level < depth) {
+    const next: string[] = [];
+    for (const sha of frontier) {
+      if (included.has(sha)) continue;
+      const object = store.get(sha);
+      if (object === undefined || object.type !== 'commit') continue;
+      included.add(sha);
+      if (level + 1 < depth) {
+        for (const parent of parseCommitData(object.data).parents) next.push(parent);
+      }
+    }
+    frontier = next;
+    level += 1;
+  }
+  return included;
+}
+
 function planFetch(store: ObjectStore, request: FetchRequest): FetchPlan {
   const clientShallow = new Set(request.shallow);
   const held = haveClosure(store, request.haves, clientShallow);
@@ -223,10 +250,10 @@ function planFetch(store: ObjectStore, request: FetchRequest): FetchPlan {
       included.add(want);
       continue;
     }
-    const gens = generations(store, want);
-    for (const [sha, generation] of gens) {
-      if (request.depth !== null && generation >= request.depth) continue;
-      includedCommits.add(sha);
+    if (request.depth === null) {
+      for (const sha of generations(store, want).keys()) includedCommits.add(sha);
+    } else {
+      for (const sha of commitsWithinDepth(store, want, request.depth)) includedCommits.add(sha);
     }
   }
   for (const sha of includedCommits) includeCommitClosure(sha);

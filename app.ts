@@ -62,37 +62,54 @@ interface Route {
 
 export class Router {
   private readonly routes: Route[] = [];
+  /** (method, segments) -> the route a full scan would pick, or null. */
+  private readonly matchCache = new Map<string, Route | null>();
 
   add(method: string, pattern: string, handler: Handler): void {
     this.routes.push({ method, pattern: pattern.split('/').filter((s) => s !== ''), handler });
+    this.matchCache.clear();
+  }
+
+  /** Whether `route` matches `segments` (params aside), in registration order semantics. */
+  private static matches(route: Route, segments: string[]): boolean {
+    let i = 0;
+    for (const part of route.pattern) {
+      if (part.startsWith(':') && part.endsWith('*')) return true;
+      if (i >= segments.length) return false;
+      if (!part.startsWith(':') && part !== segments[i]) return false;
+      i += 1;
+    }
+    return i === segments.length;
+  }
+
+  private static paramsOf(route: Route, segments: string[]): Record<string, string> {
+    const params: Record<string, string> = {};
+    let i = 0;
+    for (const part of route.pattern) {
+      if (part.startsWith(':') && part.endsWith('*')) {
+        params[part.slice(1, -1)] = segments.slice(i).join('/');
+        break;
+      }
+      if (part.startsWith(':')) params[part.slice(1)] = segments[i]!;
+      i += 1;
+    }
+    return params;
   }
 
   match(method: string, segments: string[]): { handler: Handler; params: Record<string, string> } | null {
-    for (const route of this.routes) {
-      if (route.method !== method) continue;
-      const params: Record<string, string> = {};
-      let i = 0;
-      let ok = true;
-      for (const part of route.pattern) {
-        if (part.startsWith(':') && part.endsWith('*')) {
-          params[part.slice(1, -1)] = segments.slice(i).join('/');
-          i = segments.length;
-          break;
-        }
-        if (i >= segments.length) {
-          ok = false;
-          break;
-        }
-        if (part.startsWith(':')) params[part.slice(1)] = segments[i]!;
-        else if (part !== segments[i]) {
-          ok = false;
-          break;
-        }
-        i += 1;
-      }
-      if (ok && i === segments.length) return { handler: route.handler, params };
+    // The route table is fixed once registration ends, so the winning route
+    // for a (method, path) pair never changes; only params are per-request.
+    // Hot paths (the suite re-reads one issue thousands of times) skip the
+    // linear scan over every registered route.
+    const key = `${method} ${JSON.stringify(segments)}`;
+    let route = this.matchCache.get(key);
+    if (route === undefined) {
+      route = this.routes.find((candidate) => candidate.method === method && Router.matches(candidate, segments)) ?? null;
+      if (this.matchCache.size >= 1024) this.matchCache.clear();
+      this.matchCache.set(key, route);
     }
-    return null;
+    if (route === null) return null;
+    return { handler: route.handler, params: Router.paramsOf(route, segments) };
   }
 }
 

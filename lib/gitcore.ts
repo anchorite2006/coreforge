@@ -84,7 +84,14 @@ export function buildTreeData(entries: readonly TreeEntry[]): Buffer {
   return Buffer.concat(parts);
 }
 
+const treeParseCache = new WeakMap<Buffer, TreeEntry[]>();
+
 export function parseTreeData(data: Buffer): TreeEntry[] {
+  // Object payloads are immutable once stored, so a parse keyed by the
+  // payload buffer itself stays valid for the buffer's lifetime. Callers
+  // treat the result as read-only.
+  const cached = treeParseCache.get(data);
+  if (cached !== undefined) return cached;
   const entries: TreeEntry[] = [];
   let offset = 0;
   while (offset < data.length) {
@@ -98,6 +105,7 @@ export function parseTreeData(data: Buffer): TreeEntry[] {
     entries.push({ mode, name, sha });
     offset = nul + 21;
   }
+  treeParseCache.set(data, entries);
   return entries;
 }
 
@@ -190,7 +198,19 @@ function parseIdentTime(line: string): number {
   return match === null ? 0 : Number.parseInt(match[1]!, 10);
 }
 
+const commitParseCache = new WeakMap<Buffer, ParsedCommit>();
+
 export function parseCommitData(data: Buffer): ParsedCommit {
+  // Memoized on the payload buffer (see parseTreeData): ancestry walks and
+  // fetch planning re-parse the same commits on every request otherwise.
+  const cached = commitParseCache.get(data);
+  if (cached !== undefined) return cached;
+  const parsed = parseCommitDataFresh(data);
+  commitParseCache.set(data, parsed);
+  return parsed;
+}
+
+function parseCommitDataFresh(data: Buffer): ParsedCommit {
   const text = data.toString('utf8');
   const split = text.indexOf('\n\n');
   const header = split < 0 ? text : text.slice(0, split);
@@ -215,7 +235,17 @@ export interface ParsedTag {
   message: string;
 }
 
+const tagParseCache = new WeakMap<Buffer, ParsedTag>();
+
 export function parseTagData(data: Buffer): ParsedTag {
+  const cached = tagParseCache.get(data);
+  if (cached !== undefined) return cached;
+  const parsed = parseTagDataFresh(data);
+  tagParseCache.set(data, parsed);
+  return parsed;
+}
+
+function parseTagDataFresh(data: Buffer): ParsedTag {
   const text = data.toString('utf8');
   const split = text.indexOf('\n\n');
   const header = split < 0 ? text : text.slice(0, split);
@@ -431,11 +461,14 @@ function readPackVarint(buffer: Buffer, offset: number): { value: number; next: 
 /**
  * Inflate the deflate stream starting at `offset`. zlib tolerates bytes past
  * the stream's end, so the stream's exact length is the smallest prefix that
- * inflates — found by binary search instead of a streaming decoder.
+ * inflates — found by binary search instead of a streaming decoder. The
+ * search starts under a cap derived from the entry's declared inflated size
+ * (no zlib stream for n bytes runs much past deflateBound(n)); if the cap
+ * does not inflate, the search falls back to the whole remainder, exactly
+ * as before. `exactLength`, when the caller knows it (the pack's last entry
+ * ends at the trailer), skips the search after one verifying attempt.
  */
-function inflateAt(buffer: Buffer, offset: number): { data: Buffer; length: number } {
-  let lo = 1;
-  let hi = buffer.length - offset;
+function inflateAt(buffer: Buffer, offset: number, inflatedSize: number, exactLength?: number): { data: Buffer; length: number } {
   const attempt = (length: number): Buffer | null => {
     try {
       return inflateSync(buffer.subarray(offset, offset + length));
@@ -443,6 +476,14 @@ function inflateAt(buffer: Buffer, offset: number): { data: Buffer; length: numb
       return null;
     }
   };
+  if (exactLength !== undefined) {
+    const data = attempt(exactLength);
+    if (data !== null && data.length === inflatedSize) return { data, length: exactLength };
+  }
+  let lo = 1;
+  let hi = buffer.length - offset;
+  const cap = inflatedSize + (inflatedSize >> 12) + (inflatedSize >> 14) + (inflatedSize >> 25) + 64;
+  if (cap < hi && attempt(cap) !== null) hi = cap;
   if (attempt(hi) === null) throw new Error('corrupt pack: entry does not inflate');
   while (lo < hi) {
     const mid = (lo + hi) >> 1;
@@ -548,7 +589,8 @@ export function readPack(store: ObjectStore, pack: Buffer): string[] {
       baseSha = pack.toString('hex', offset, offset + 20);
       offset += 20;
     }
-    const inflated = inflateAt(pack, offset);
+    const isLast = i === count - 1;
+    const inflated = inflateAt(pack, offset, header.value, isLast ? pack.length - 20 - offset : undefined);
     offset += inflated.length;
     const entry: PendingEntry = {
       offset: start,
@@ -600,8 +642,59 @@ export function readPack(store: ObjectStore, pack: Buffer): string[] {
   return shas;
 }
 
+interface PackCaches {
+  /** sha -> the object's whole pack entry (varint header + deflated payload). */
+  entries: Map<string, Buffer>;
+  /** sha list -> a complete pack previously built for exactly that list. */
+  packs: Map<string, Buffer>;
+}
+
+const packCaches = new WeakMap<ObjectStore, PackCaches>();
+
+function cachesFor(store: ObjectStore): PackCaches {
+  let caches = packCaches.get(store);
+  if (caches === undefined) {
+    caches = { entries: new Map(), packs: new Map() };
+    packCaches.set(store, caches);
+  }
+  return caches;
+}
+
+/** One object's pack entry; deflating the same object twice is pure waste. */
+function packEntry(caches: PackCaches, sha: string, object: StoredObject): Buffer {
+  const cached = caches.entries.get(sha);
+  if (cached !== undefined) return cached;
+  const typeId = PACK_TYPE_NUMBERS[object.type];
+  let size = object.data.length;
+  const first = (typeId << 4) | (size & 0x0f);
+  size >>= 4;
+  const headBytes: number[] = [];
+  if (size === 0) {
+    headBytes.push(first);
+  } else {
+    headBytes.push(first | 0x80);
+    while (size > 0) {
+      let byte = size & 0x7f;
+      size >>= 7;
+      if (size > 0) byte |= 0x80;
+      headBytes.push(byte);
+    }
+  }
+  const entry = Buffer.concat([Buffer.from(headBytes), deflateSync(object.data)]);
+  if (caches.entries.size >= 16384) caches.entries.clear();
+  caches.entries.set(sha, entry);
+  return entry;
+}
+
 /** Serialize the given objects as a complete pack (full objects, no deltas). */
 export function writePack(store: ObjectStore, shas: readonly string[]): Buffer {
+  // Objects are content-addressed and immutable, so a pack built for a sha
+  // list — and each object's deflated entry inside it — can be replayed
+  // verbatim for every later fetch that asks for the same objects.
+  const caches = cachesFor(store);
+  const key = shas.join(',');
+  const cachedPack = caches.packs.get(key);
+  if (cachedPack !== undefined) return cachedPack;
   const header = Buffer.alloc(12);
   header.write('PACK', 0, 'ascii');
   header.writeUInt32BE(2, 4);
@@ -610,26 +703,12 @@ export function writePack(store: ObjectStore, shas: readonly string[]): Buffer {
   for (const sha of shas) {
     const object = store.get(sha);
     if (object === undefined) throw new Error(`cannot pack missing object ${sha}`);
-    const typeId = PACK_TYPE_NUMBERS[object.type];
-    let size = object.data.length;
-    const first = (typeId << 4) | (size & 0x0f);
-    size >>= 4;
-    const headBytes: number[] = [];
-    if (size === 0) {
-      headBytes.push(first);
-    } else {
-      headBytes.push(first | 0x80);
-      while (size > 0) {
-        let byte = size & 0x7f;
-        size >>= 7;
-        if (size > 0) byte |= 0x80;
-        headBytes.push(byte);
-      }
-    }
-    parts.push(Buffer.from(headBytes));
-    parts.push(deflateSync(object.data));
+    parts.push(packEntry(caches, sha, object));
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
-  return Buffer.concat([body, trailer]);
+  const pack = Buffer.concat([body, trailer]);
+  if (caches.packs.size >= 64) caches.packs.clear();
+  caches.packs.set(key, pack);
+  return pack;
 }
