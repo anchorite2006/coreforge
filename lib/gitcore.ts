@@ -22,7 +22,7 @@ export const ZERO_OID = '0000000000000000000000000000000000000000';
 
 export function hashObject(type: ObjectType, data: Buffer): string {
   const hash = createHash('sha1');
-  hash.update(Buffer.from(`${type} ${data.length}\0`, 'utf8'));
+  hash.update(`${type} ${data.length}\0`, 'utf8');
   hash.update(data);
   return hash.digest('hex');
 }
@@ -479,6 +479,20 @@ function inflateAt(buffer: Buffer, offset: number, inflatedSize: number, exactLe
   if (exactLength !== undefined) {
     const data = attempt(exactLength);
     if (data !== null && data.length === inflatedSize) return { data, length: exactLength };
+  }
+  // Fast path: one inflate of the whole remainder. With { info: true } zlib
+  // reports how many input bytes the stream actually consumed, which is the
+  // exact stream length — no binary search over throwing truncated attempts.
+  // Any implausible report falls through to the search below.
+  try {
+    const remainder = buffer.subarray(offset);
+    const result = inflateSync(remainder, { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+    const consumed = result.engine.bytesWritten;
+    if (consumed > 0 && consumed <= remainder.length && result.buffer.length === inflatedSize) {
+      return { data: result.buffer, length: consumed };
+    }
+  } catch {
+    // Fall through to the binary search, which throws for corrupt entries.
   }
   let lo = 1;
   let hi = buffer.length - offset;

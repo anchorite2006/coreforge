@@ -101,7 +101,10 @@ export class Router {
     // for a (method, path) pair never changes; only params are per-request.
     // Hot paths (the suite re-reads one issue thousands of times) skip the
     // linear scan over every registered route.
-    const key = `${method} ${JSON.stringify(segments)}`;
+    // Length-prefixed key: collision-safe even when a decoded segment
+    // contains '/' or ':' (e.g. from %2F), unlike a naive join.
+    let key = method;
+    for (const segment of segments) key += ` ${segment.length}:${segment}`;
     let route = this.matchCache.get(key);
     if (route === undefined) {
       route = this.routes.find((candidate) => candidate.method === method && Router.matches(candidate, segments)) ?? null;
@@ -128,6 +131,8 @@ export function jsonBody(req: HandlerRequest): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
+const EMPTY_BODY: Buffer = Buffer.alloc(0);
+
 function readBody(stream: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -153,7 +158,10 @@ export function createApp(ctx: AppContext, router: Router): Server {
       requestCounter += 1;
       const requestId = `F${requestCounter.toString(16).toUpperCase().padStart(4, '0')}:A1B2:${requestCounter}`;
       const send = (response: HandlerResponse): void => {
-        const headers: Record<string, string> = { 'x-github-request-id': requestId, ...(response.headers ?? {}) };
+        const headers: Record<string, string> = { 'x-github-request-id': requestId };
+        if (response.headers !== undefined) {
+          for (const name of Object.keys(response.headers)) headers[name] = response.headers[name]!;
+        }
         let payload: Buffer;
         if (response.raw !== undefined) {
           payload = response.raw;
@@ -162,7 +170,7 @@ export function createApp(ctx: AppContext, router: Router): Server {
           payload = Buffer.from(JSON.stringify(response.json), 'utf8');
           headers['content-type'] = 'application/json; charset=utf-8';
         } else {
-          payload = Buffer.alloc(0);
+          payload = EMPTY_BODY;
         }
         headers['content-length'] = String(payload.length);
         outgoing.writeHead(response.status, headers);
@@ -174,6 +182,8 @@ export function createApp(ctx: AppContext, router: Router): Server {
           .split('/')
           .filter((s) => s !== '')
           .map((s) => {
+            // decodeURIComponent is the identity on strings without '%'.
+            if (!s.includes('%')) return s;
             try {
               return decodeURIComponent(s);
             } catch {
@@ -188,7 +198,14 @@ export function createApp(ctx: AppContext, router: Router): Server {
           return;
         }
 
-        const body = await readBody(incoming);
+        // Bodyless requests skip readBody entirely: attaching stream
+        // listeners and waiting for 'end' costs an extra event-loop turn
+        // per request. A request carries a body only when its headers say
+        // so; GET/HEAD/DELETE without body headers never have one.
+        const contentLength = incoming.headers['content-length'];
+        const hasBodyHeaders = contentLength !== undefined || incoming.headers['transfer-encoding'] !== undefined;
+        const bodylessMethod = method === 'GET' || method === 'HEAD' || method === 'DELETE';
+        const body = contentLength === '0' || (bodylessMethod && !hasBodyHeaders) ? EMPTY_BODY : await readBody(incoming);
 
         if (ctx.token !== '') {
           const presented = incoming.headers.authorization ?? '';

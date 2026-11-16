@@ -59,6 +59,8 @@ export class RepoRecord {
   readonly refs = new Map<string, string>();
   /** The ref HEAD points at; the repository is "unborn" while it has no target sha. */
   headRef: string = DEFAULT_HEAD_REF;
+  /** Bumped at every refs mutation; caches keyed on refs content check it. */
+  refsVersion = 0;
   readonly labels = new Map<string, LabelRecord>();
   readonly issues = new Map<number, IssueRecord>();
   readonly pulls = new Map<number, PullRecord>();

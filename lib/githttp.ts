@@ -108,7 +108,32 @@ function receiveCaps(): string {
   return ['report-status', 'side-band-64k', 'delete-refs', 'ofs-delta', `agent=${AGENT}`].join(' ');
 }
 
+interface AdvertisementCache {
+  version: number;
+  upload?: Buffer;
+  receive?: Buffer;
+}
+
+const advertisementCaches = new WeakMap<RepoRecord, AdvertisementCache>();
+
 function v0Advertisement(repo: RepoRecord, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  // The advertisement is a pure function of the repo's refs (headRef never
+  // changes after creation, and objects are immutable once stored), so it
+  // can be replayed verbatim until the refs version moves.
+  let cache = advertisementCaches.get(repo);
+  if (cache === undefined || cache.version !== repo.refsVersion) {
+    cache = { version: repo.refsVersion };
+    advertisementCaches.set(repo, cache);
+  }
+  const cached = service === 'git-upload-pack' ? cache.upload : cache.receive;
+  if (cached !== undefined) return cached;
+  const built = buildV0Advertisement(repo, service);
+  if (service === 'git-upload-pack') cache.upload = built;
+  else cache.receive = built;
+  return built;
+}
+
+function buildV0Advertisement(repo: RepoRecord, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
   const caps = service === 'git-upload-pack' ? uploadCaps(repo) : receiveCaps();
   const parts: Buffer[] = [pktText(`# service=${service}\n`), FLUSH];
   const headSha = repo.headSha();
@@ -143,9 +168,15 @@ function v0Advertisement(repo: RepoRecord, service: 'git-upload-pack' | 'git-rec
   return Buffer.concat(parts);
 }
 
+let v2AdvertisementCache: Buffer | undefined;
+
 function v2Advertisement(): Buffer {
-  const lines = ['version 2', `agent=${AGENT}`, 'ls-refs=unborn', 'fetch=shallow wait-for-done', 'object-format=sha1'];
-  return Buffer.concat([...lines.map((line) => pktText(`${line}\n`)), FLUSH]);
+  // Fully constant: build the buffer once and replay it for every request.
+  if (v2AdvertisementCache === undefined) {
+    const lines = ['version 2', `agent=${AGENT}`, 'ls-refs=unborn', 'fetch=shallow wait-for-done', 'object-format=sha1'];
+    v2AdvertisementCache = Buffer.concat([...lines.map((line) => pktText(`${line}\n`)), FLUSH]);
+  }
+  return v2AdvertisementCache;
 }
 
 // ---------------------------------------------------------------- fetch planning
@@ -464,6 +495,7 @@ function handleReceivePack(repo: RepoRecord, body: Buffer): Buffer {
     }
     if (command.newOid === ZERO_OID) {
       repo.refs.delete(command.ref);
+      repo.refsVersion += 1;
       results.push({ ref: command.ref, ok: true, reason: '' });
       continue;
     }
@@ -483,6 +515,7 @@ function handleReceivePack(repo: RepoRecord, body: Buffer): Buffer {
       }
     }
     repo.refs.set(command.ref, command.newOid);
+    repo.refsVersion += 1;
     results.push({ ref: command.ref, ok: true, reason: '' });
   }
 

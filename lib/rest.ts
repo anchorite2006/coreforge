@@ -173,6 +173,7 @@ function commitFlat(ctx: AppContext, repo: RepoRecord, branchRef: string, flat: 
   });
   const sha = repo.store.put('commit', data);
   repo.refs.set(branchRef, sha);
+  repo.refsVersion += 1;
   return sha;
 }
 
@@ -309,6 +310,7 @@ export function mergePull(ctx: AppContext, repo: RepoRecord, pull: PullRecord): 
   const data = buildCommitData({ tree: outcome.tree, parents: [baseSha], author: ident, committer: ident, message });
   const sha = store.put('commit', data);
   repo.refs.set(baseRef, sha);
+  repo.refsVersion += 1;
   pull.state = 'closed';
   pull.merged = true;
   pull.mergedAt = ctx.clock.nowIso();
@@ -544,6 +546,7 @@ export function registerRestRoutes(router: Router): void {
     }
     if (repo.refs.has(ref)) throw new HttpError(422, 'Reference already exists');
     repo.refs.set(ref, sha);
+    repo.refsVersion += 1;
     const object = repo.store.get(sha)!;
     return { status: 201, json: { ref, object: { sha, type: object.type } } };
   });
