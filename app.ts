@@ -177,8 +177,30 @@ export function createApp(ctx: AppContext, router: Router): Server {
         outgoing.end(payload);
       };
       try {
-        const url = new URL(incoming.url ?? '/', 'http://forge.invalid');
-        const segments = url.pathname
+        // Fast path for the origin-form URLs the suite sends: split the
+        // query off by hand instead of paying a WHATWG URL parse per
+        // request. Anything the WHATWG parser would normalize (dot
+        // segments, backslashes, fragments, controls) takes the exact
+        // original path through `new URL`.
+        const rawUrl = incoming.url ?? '/';
+        let pathname: string;
+        let query: URLSearchParams;
+        if (
+          rawUrl.startsWith('/') &&
+          !rawUrl.includes('#') &&
+          !rawUrl.includes('\\') &&
+          !rawUrl.includes('/.') &&
+          !/[^\x21-\x7e]/.test(rawUrl)
+        ) {
+          const q = rawUrl.indexOf('?');
+          pathname = q < 0 ? rawUrl : rawUrl.slice(0, q);
+          query = new URLSearchParams(q < 0 ? '' : rawUrl.slice(q + 1));
+        } else {
+          const url = new URL(rawUrl, 'http://forge.invalid');
+          pathname = url.pathname;
+          query = url.searchParams;
+        }
+        const segments = pathname
           .split('/')
           .filter((s) => s !== '')
           .map((s) => {
@@ -193,7 +215,7 @@ export function createApp(ctx: AppContext, router: Router): Server {
         const method = (incoming.method ?? 'GET').toUpperCase();
 
         // The boot probe: no auth, always the same tiny answer.
-        if (method === 'GET' && url.pathname === '/healthz') {
+        if (method === 'GET' && pathname === '/healthz') {
           send({ status: 200, json: { ok: true } });
           return;
         }
@@ -220,15 +242,18 @@ export function createApp(ctx: AppContext, router: Router): Server {
           send({ status: 404, json: { message: 'Not Found' } });
           return;
         }
-        const response = await matched.handler({
+        const result = matched.handler({
           method,
           segments,
           params: matched.params,
-          query: url.searchParams,
+          query,
           headers: incoming.headers,
           body,
           ctx,
         });
+        // Most handlers are synchronous; awaiting a non-promise still costs
+        // a microtask turn per request on the sequential workloads.
+        const response = result instanceof Promise ? await result : result;
         send(response);
       } catch (error) {
         if (error instanceof HttpError) {

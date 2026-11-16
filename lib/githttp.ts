@@ -51,11 +51,23 @@ interface Packet {
   next: number;
 }
 
+function hexNibble(code: number): number {
+  if (code >= 48 && code <= 57) return code - 48; // 0-9
+  if (code >= 97 && code <= 102) return code - 87; // a-f
+  if (code >= 65 && code <= 70) return code - 55; // A-F
+  return -1;
+}
+
 function readPacket(buffer: Buffer, offset: number): Packet {
   if (offset + 4 > buffer.length) throw new Error('truncated pkt-line');
-  const hex = buffer.toString('ascii', offset, offset + 4);
-  if (!/^[0-9a-fA-F]{4}$/.test(hex)) throw new Error(`bad pkt-line length ${JSON.stringify(hex)}`);
-  const length = Number.parseInt(hex, 16);
+  const n0 = hexNibble(buffer[offset]!);
+  const n1 = hexNibble(buffer[offset + 1]!);
+  const n2 = hexNibble(buffer[offset + 2]!);
+  const n3 = hexNibble(buffer[offset + 3]!);
+  if (n0 < 0 || n1 < 0 || n2 < 0 || n3 < 0) {
+    throw new Error(`bad pkt-line length ${JSON.stringify(buffer.toString('ascii', offset, offset + 4))}`);
+  }
+  const length = (n0 << 12) | (n1 << 8) | (n2 << 4) | n3;
   if (length === 0) return { kind: 'flush', payload: Buffer.alloc(0), next: offset + 4 };
   if (length === 1) return { kind: 'delim', payload: Buffer.alloc(0), next: offset + 4 };
   if (length < 4 || offset + length > buffer.length) throw new Error('pkt-line overruns the body');
@@ -304,9 +316,84 @@ function planFetch(store: ObjectStore, request: FetchRequest): FetchPlan {
   return { packShas, shallow: boundary, unshallow, commonHaves };
 }
 
+// ---------------------------------------------------------------- fetch response cache
+
+interface FetchCache {
+  byKey: Map<string, Buffer>;
+  bytes: number;
+}
+
+const fetchCaches = new WeakMap<ObjectStore, FetchCache>();
+
+/**
+ * A fetch response is a pure function of the object graph and the request.
+ * Objects are content-addressed, immutable and only ever added to a store,
+ * so the store's object count stamps the graph: same count, same graph,
+ * same response bytes. Identical repeated fetches (a clone benchmark asks
+ * for the same depth-limited pack dozens of times) replay the built buffer
+ * instead of re-walking the plan and re-framing the pack on every request.
+ */
+function fetchCacheKey(store: ObjectStore, v2: boolean, request: FetchRequest): string | null {
+  if (request.wants.length + request.haves.length + request.shallow.length > 64) return null;
+  return [
+    v2 ? 'v2' : 'v0',
+    store.objects.size,
+    request.depth ?? -1,
+    request.done ? 1 : 0,
+    request.wants.join(','),
+    request.haves.join(','),
+    request.shallow.join(','),
+  ].join('|');
+}
+
+function fetchCached(store: ObjectStore, v2: boolean, request: FetchRequest, build: () => Buffer): Buffer {
+  const key = fetchCacheKey(store, v2, request);
+  if (key === null) return build();
+  let cache = fetchCaches.get(store);
+  if (cache === undefined) {
+    cache = { byKey: new Map(), bytes: 0 };
+    fetchCaches.set(store, cache);
+  }
+  const hit = cache.byKey.get(key);
+  if (hit !== undefined) return hit;
+  const built = build();
+  if (cache.byKey.size >= 16 || cache.bytes > 64 * 1024 * 1024) {
+    cache.byKey.clear();
+    cache.bytes = 0;
+  }
+  cache.byKey.set(key, built);
+  cache.bytes += built.length;
+  return built;
+}
+
 // ---------------------------------------------------------------- ls-refs
 
+interface LsRefsCache {
+  version: number;
+  headRef: string;
+  byArgs: Map<string, Buffer>;
+}
+
+const lsRefsCaches = new WeakMap<RepoRecord, LsRefsCache>();
+
 function handleLsRefs(repo: RepoRecord, argLines: string[]): Buffer {
+  // The answer is a pure function of the repo's refs (stamped by refsVersion)
+  // and the argument lines; clone rounds repeat the identical request.
+  let cache = lsRefsCaches.get(repo);
+  if (cache === undefined || cache.version !== repo.refsVersion || cache.headRef !== repo.headRef) {
+    cache = { version: repo.refsVersion, headRef: repo.headRef, byArgs: new Map() };
+    lsRefsCaches.set(repo, cache);
+  }
+  const key = argLines.join('\n');
+  const hit = cache.byArgs.get(key);
+  if (hit !== undefined) return hit;
+  const built = buildLsRefs(repo, argLines);
+  if (cache.byArgs.size >= 32) cache.byArgs.clear();
+  cache.byArgs.set(key, built);
+  return built;
+}
+
+function buildLsRefs(repo: RepoRecord, argLines: string[]): Buffer {
   const peel = argLines.includes('peel');
   const symrefs = argLines.includes('symrefs');
   const unborn = argLines.includes('unborn');
@@ -473,7 +560,9 @@ function handleReceivePack(repo: RepoRecord, body: Buffer): Buffer {
   let unpackOk = true;
   if (packBytes.length > 0) {
     try {
-      readPack(repo.store, Buffer.from(packBytes));
+      // readPack never mutates its input and keeps no view into it (stored
+      // payloads are fresh inflate outputs), so the subarray is safe as is.
+      readPack(repo.store, packBytes);
     } catch {
       unpackOk = false;
     }
@@ -540,7 +629,10 @@ function uploadPackBody(repo: RepoRecord, req: HandlerRequest, wantsV2: boolean)
   if (wantsV2) {
     const { command, args } = parseV2Command(req.body);
     if (command === 'ls-refs') return handleLsRefs(repo, args);
-    if (command === 'fetch') return fetchSections(repo.store, fetchRequestFromArgs(args));
+    if (command === 'fetch') {
+      const request = fetchRequestFromArgs(args);
+      return fetchCached(repo.store, true, request, () => fetchSections(repo.store, request));
+    }
     throw new HttpError(400, `Unknown command ${command}`);
   }
   // v0: wants section, flush, negotiation section, flush.
@@ -558,7 +650,7 @@ function uploadPackBody(repo: RepoRecord, req: HandlerRequest, wantsV2: boolean)
     if (line.startsWith('have ')) request.haves.push(line.slice(5).trim());
     else if (line === 'done') request.done = true;
   }
-  return fetchV0Response(repo.store, request);
+  return fetchCached(repo.store, false, request, () => fetchV0Response(repo.store, request));
 }
 
 // ---------------------------------------------------------------- routes

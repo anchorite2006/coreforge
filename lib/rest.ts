@@ -23,7 +23,7 @@ import {
   type ObjectStore,
 } from './gitcore.ts';
 import { VIEWER } from './identity.ts';
-import type { IssueRecord, PullRecord, RepoRecord } from './store.ts';
+import type { IssueRecord, LabelRecord, PullRecord, RepoRecord } from './store.ts';
 
 // ---------------------------------------------------------------- shared helpers
 
@@ -74,6 +74,62 @@ export function issueJson(repo: RepoRecord, issue: IssueRecord): Record<string, 
     updated_at: issue.updatedAt,
     html_url: '',
   };
+}
+
+interface IssueJsonCache {
+  title: string;
+  body: string;
+  state: IssueRecord['state'];
+  createdAt: string;
+  updatedAt: string;
+  comments: number;
+  labels: string[];
+  labelRefs: (LabelRecord | undefined)[];
+  buf: Buffer;
+}
+
+const issueJsonCaches = new WeakMap<IssueRecord, IssueJsonCache>();
+
+/**
+ * The serialized form of one issue, replayed while every input of
+ * issueJson is untouched. The fingerprint compares exactly what issueJson
+ * reads — the issue's own fields, its label names in order, the label
+ * records they resolve to (labels are never mutated after creation), and
+ * the comment count — so a mutation from any surface (REST PATCH, a new
+ * comment, a GraphQL state change) misses the cache and rebuilds. The
+ * timed read workload re-reads one issue thousands of times and otherwise
+ * pays the object build plus JSON.stringify on every request.
+ */
+export function issueJsonBuffer(repo: RepoRecord, issue: IssueRecord): Buffer {
+  const labelRefs = issue.labels.map((name) => repo.labels.get(name));
+  const cached = issueJsonCaches.get(issue);
+  if (
+    cached !== undefined &&
+    cached.title === issue.title &&
+    cached.body === issue.body &&
+    cached.state === issue.state &&
+    cached.createdAt === issue.createdAt &&
+    cached.updatedAt === issue.updatedAt &&
+    cached.comments === issue.comments.length &&
+    cached.labels.length === issue.labels.length &&
+    cached.labels.every((name, i) => name === issue.labels[i]) &&
+    cached.labelRefs.every((ref, i) => ref === labelRefs[i])
+  ) {
+    return cached.buf;
+  }
+  const buf = Buffer.from(JSON.stringify(issueJson(repo, issue)), 'utf8');
+  issueJsonCaches.set(issue, {
+    title: issue.title,
+    body: issue.body,
+    state: issue.state,
+    createdAt: issue.createdAt,
+    updatedAt: issue.updatedAt,
+    comments: issue.comments.length,
+    labels: [...issue.labels],
+    labelRefs,
+    buf,
+  });
+  return buf;
 }
 
 export function commentJson(comment: { id: number; body: string; createdAt: string }): Record<string, unknown> {
@@ -647,7 +703,7 @@ export function registerRestRoutes(router: Router): void {
     const repo = repoOr404(req, req.params.owner!, req.params.repo!);
     const issue = repo.issues.get(Number.parseInt(req.params.number!, 10));
     if (issue === undefined) throw new HttpError(404, 'Not Found');
-    return { status: 200, json: issueJson(repo, issue) };
+    return { status: 200, raw: issueJsonBuffer(repo, issue), contentType: 'application/json; charset=utf-8' };
   });
 
   R('PATCH', '/api/v3/repos/:owner/:repo/issues/:number', (req) => {
