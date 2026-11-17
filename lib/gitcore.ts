@@ -617,6 +617,28 @@ export function readPack(store: ObjectStore, pack: Buffer): string[] {
     byOffset.set(start, entry);
   }
 
+  // Fast path: a pack carrying no delta entries (every client the suite
+  // drives sends whole objects) resolves each entry independently, exactly
+  // as resolve() below would — same hashes, same store adds, same order —
+  // without the memo table and closure chain per pack.
+  let hasDelta = false;
+  for (const entry of entries) {
+    if (entry.type === 'ofs-delta' || entry.type === 'ref-delta') {
+      hasDelta = true;
+      break;
+    }
+  }
+  if (!hasDelta) {
+    const shas: string[] = [];
+    for (const entry of entries) {
+      const type = entry.type as ObjectType;
+      const sha = hashObject(type, entry.payload);
+      store.add(sha, type, entry.payload);
+      shas.push(sha);
+    }
+    return shas;
+  }
+
   const resolved = new Map<number, { sha: string; type: ObjectType; data: Buffer }>();
   const resolve = (entry: PendingEntry): { sha: string; type: ObjectType; data: Buffer } => {
     const cached = resolved.get(entry.offset);

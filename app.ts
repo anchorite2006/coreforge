@@ -96,15 +96,25 @@ export class Router {
     return params;
   }
 
-  match(method: string, segments: string[]): { handler: Handler; params: Record<string, string> } | null {
+  match(method: string, segments: string[], cacheKey?: string): { handler: Handler; params: Record<string, string> } | null {
     // The route table is fixed once registration ends, so the winning route
     // for a (method, path) pair never changes; only params are per-request.
     // Hot paths (the suite re-reads one issue thousands of times) skip the
     // linear scan over every registered route.
-    // Length-prefixed key: collision-safe even when a decoded segment
-    // contains '/' or ':' (e.g. from %2F), unlike a naive join.
-    let key = method;
-    for (const segment of segments) key += ` ${segment.length}:${segment}`;
+    // The caller passes the request's pathname as the cache key when it has
+    // one: segments are a deterministic function of the pathname, so equal
+    // pathnames always select the same route. Without one, fall back to a
+    // length-prefixed key over the segments — collision-safe even when a
+    // decoded segment contains '/' or ':' (e.g. from %2F), unlike a naive
+    // join. (A pathname never contains a NUL: the fast path rejects control
+    // characters and the WHATWG parser percent-encodes them.)
+    let key: string;
+    if (cacheKey !== undefined) {
+      key = `${method}\0${cacheKey}`;
+    } else {
+      key = method;
+      for (const segment of segments) key += ` ${segment.length}:${segment}`;
+    }
     let route = this.matchCache.get(key);
     if (route === undefined) {
       route = this.routes.find((candidate) => candidate.method === method && Router.matches(candidate, segments)) ?? null;
@@ -151,93 +161,134 @@ function readBody(stream: IncomingMessage): Promise<Buffer> {
   });
 }
 
+const EMPTY_QUERY: URLSearchParams = new URLSearchParams();
+
+function decodeSegment(segment: string): string {
+  // decodeURIComponent is the identity on strings without '%'.
+  if (!segment.includes('%')) return segment;
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
+  }
+}
+
+/** Split a pathname into decoded segments, dropping empties (leading '/',
+ * trailing '/', doubles) exactly as split('/').filter(nonempty) would. */
+function segmentsOf(pathname: string): string[] {
+  const segments: string[] = [];
+  let start = 0;
+  for (let i = 0; i <= pathname.length; i += 1) {
+    if (i === pathname.length || pathname.charCodeAt(i) === 47) {
+      if (i > start) segments.push(decodeSegment(pathname.slice(start, i)));
+      start = i + 1;
+    }
+  }
+  return segments;
+}
+
+/**
+ * Whether the hand-rolled URL split below is exact for `rawUrl`: the WHATWG
+ * parser would normalize (and so the split could differ) when the URL has a
+ * fragment, a backslash, a '/.' dot segment, or any character outside
+ * printable ASCII. One pass instead of three includes() scans plus a regex.
+ */
+function urlFastPathOk(rawUrl: string): boolean {
+  if (rawUrl.length === 0 || rawUrl.charCodeAt(0) !== 47) return false;
+  for (let i = 0; i < rawUrl.length; i += 1) {
+    const code = rawUrl.charCodeAt(i);
+    if (code < 0x21 || code > 0x7e || code === 0x23 || code === 0x5c) return false;
+    if (code === 0x2e && rawUrl.charCodeAt(i - 1) === 47) return false;
+  }
+  return true;
+}
+
 export function createApp(ctx: AppContext, router: Router): Server {
   let requestCounter = 0;
+  const expectedAuth = ctx.token === '' ? null : `Bearer ${ctx.token}`;
   const server = createServer((incoming: IncomingMessage, outgoing: ServerResponse) => {
-    void (async () => {
-      requestCounter += 1;
-      const requestId = `F${requestCounter.toString(16).toUpperCase().padStart(4, '0')}:A1B2:${requestCounter}`;
-      const send = (response: HandlerResponse): void => {
-        const headers: Record<string, string> = { 'x-github-request-id': requestId };
-        if (response.headers !== undefined) {
-          for (const name of Object.keys(response.headers)) headers[name] = response.headers[name]!;
-        }
-        let payload: Buffer;
-        if (response.raw !== undefined) {
-          payload = response.raw;
-          if (response.contentType !== undefined) headers['content-type'] = response.contentType;
-        } else if (response.json !== undefined) {
-          payload = Buffer.from(JSON.stringify(response.json), 'utf8');
-          headers['content-type'] = 'application/json; charset=utf-8';
-        } else {
-          payload = EMPTY_BODY;
-        }
-        headers['content-length'] = String(payload.length);
-        outgoing.writeHead(response.status, headers);
-        outgoing.end(payload);
-      };
+    requestCounter += 1;
+    const requestId = `F${requestCounter.toString(16).toUpperCase().padStart(4, '0')}:A1B2:${requestCounter}`;
+    const send = (response: HandlerResponse): void => {
+      let payload: Buffer;
+      let contentType: string | undefined;
+      if (response.raw !== undefined) {
+        payload = response.raw;
+        contentType = response.contentType;
+      } else if (response.json !== undefined) {
+        payload = Buffer.from(JSON.stringify(response.json), 'utf8');
+        contentType = 'application/json; charset=utf-8';
+      } else {
+        payload = EMPTY_BODY;
+      }
+      // Array-form headers: same names, same order as the object form built
+      // before (request id, handler headers, content type, content length),
+      // without the intermediate object.
+      const headers: [string, string][] = [['x-github-request-id', requestId]];
+      if (response.headers !== undefined) {
+        for (const name of Object.keys(response.headers)) headers.push([name, response.headers[name]!]);
+      }
+      if (contentType !== undefined) headers.push(['content-type', contentType]);
+      headers.push(['content-length', String(payload.length)]);
+      outgoing.writeHead(response.status, headers);
+      outgoing.end(payload);
+    };
+    const fail = (error: unknown): void => {
       try {
-        // Fast path for the origin-form URLs the suite sends: split the
-        // query off by hand instead of paying a WHATWG URL parse per
-        // request. Anything the WHATWG parser would normalize (dot
-        // segments, backslashes, fragments, controls) takes the exact
-        // original path through `new URL`.
-        const rawUrl = incoming.url ?? '/';
-        let pathname: string;
-        let query: URLSearchParams;
-        if (
-          rawUrl.startsWith('/') &&
-          !rawUrl.includes('#') &&
-          !rawUrl.includes('\\') &&
-          !rawUrl.includes('/.') &&
-          !/[^\x21-\x7e]/.test(rawUrl)
-        ) {
-          const q = rawUrl.indexOf('?');
-          pathname = q < 0 ? rawUrl : rawUrl.slice(0, q);
-          query = new URLSearchParams(q < 0 ? '' : rawUrl.slice(q + 1));
+        if (error instanceof HttpError) {
+          send({ status: error.status, json: { message: error.message } });
         } else {
-          const url = new URL(rawUrl, 'http://forge.invalid');
-          pathname = url.pathname;
-          query = url.searchParams;
+          console.error('unhandled handler error', error);
+          send({ status: 500, json: { message: 'Internal Server Error' } });
         }
-        const segments = pathname
-          .split('/')
-          .filter((s) => s !== '')
-          .map((s) => {
-            // decodeURIComponent is the identity on strings without '%'.
-            if (!s.includes('%')) return s;
-            try {
-              return decodeURIComponent(s);
-            } catch {
-              return s;
-            }
-          });
-        const method = (incoming.method ?? 'GET').toUpperCase();
+      } catch {
+        // The socket is already gone; there is nothing left to answer on.
+      }
+    };
 
-        // The boot probe: no auth, always the same tiny answer.
-        if (method === 'GET' && pathname === '/healthz') {
-          send({ status: 200, json: { ok: true } });
-          return;
-        }
+    let pathname: string;
+    let query: URLSearchParams;
+    let segments: string[];
+    let method: string;
+    try {
+      // Fast path for the origin-form URLs the suite sends: split the
+      // query off by hand instead of paying a WHATWG URL parse per
+      // request. Anything the WHATWG parser would normalize (dot
+      // segments, backslashes, fragments, controls) takes the exact
+      // original path through `new URL`.
+      const rawUrl = incoming.url ?? '/';
+      if (urlFastPathOk(rawUrl)) {
+        const q = rawUrl.indexOf('?');
+        pathname = q < 0 ? rawUrl : rawUrl.slice(0, q);
+        query = q < 0 ? EMPTY_QUERY : new URLSearchParams(rawUrl.slice(q + 1));
+      } else {
+        const url = new URL(rawUrl, 'http://forge.invalid');
+        pathname = url.pathname;
+        query = url.searchParams;
+      }
+      segments = segmentsOf(pathname);
+      method = (incoming.method ?? 'GET').toUpperCase();
 
-        // Bodyless requests skip readBody entirely: attaching stream
-        // listeners and waiting for 'end' costs an extra event-loop turn
-        // per request. A request carries a body only when its headers say
-        // so; GET/HEAD/DELETE without body headers never have one.
-        const contentLength = incoming.headers['content-length'];
-        const hasBodyHeaders = contentLength !== undefined || incoming.headers['transfer-encoding'] !== undefined;
-        const bodylessMethod = method === 'GET' || method === 'HEAD' || method === 'DELETE';
-        const body = contentLength === '0' || (bodylessMethod && !hasBodyHeaders) ? EMPTY_BODY : await readBody(incoming);
+      // The boot probe: no auth, always the same tiny answer.
+      if (method === 'GET' && pathname === '/healthz') {
+        send({ status: 200, json: { ok: true } });
+        return;
+      }
+    } catch (error) {
+      fail(error);
+      return;
+    }
 
-        if (ctx.token !== '') {
+    const dispatch = (body: Buffer): void => {
+      try {
+        if (expectedAuth !== null) {
           const presented = incoming.headers.authorization ?? '';
-          if (presented !== `Bearer ${ctx.token}`) {
+          if (presented !== expectedAuth) {
             send({ status: 401, json: { message: 'Bad credentials' } });
             return;
           }
         }
-
-        const matched = router.match(method, segments);
+        const matched = router.match(method, segments, pathname);
         if (matched === null) {
           send({ status: 404, json: { message: 'Not Found' } });
           return;
@@ -253,17 +304,26 @@ export function createApp(ctx: AppContext, router: Router): Server {
         });
         // Most handlers are synchronous; awaiting a non-promise still costs
         // a microtask turn per request on the sequential workloads.
-        const response = result instanceof Promise ? await result : result;
-        send(response);
+        if (result instanceof Promise) result.then(send, fail);
+        else send(result);
       } catch (error) {
-        if (error instanceof HttpError) {
-          send({ status: error.status, json: { message: error.message } });
-        } else {
-          console.error('unhandled handler error', error);
-          send({ status: 500, json: { message: 'Internal Server Error' } });
-        }
+        fail(error);
       }
-    })();
+    };
+
+    // Bodyless requests skip readBody entirely: attaching stream
+    // listeners and waiting for 'end' costs an extra event-loop turn
+    // per request. A request carries a body only when its headers say
+    // so; GET/HEAD/DELETE without body headers never have one. Requests
+    // that do carry a body are the only ones that pay for a promise.
+    const contentLength = incoming.headers['content-length'];
+    const hasBodyHeaders = contentLength !== undefined || incoming.headers['transfer-encoding'] !== undefined;
+    const bodylessMethod = method === 'GET' || method === 'HEAD' || method === 'DELETE';
+    if (contentLength === '0' || (bodylessMethod && !hasBodyHeaders)) {
+      dispatch(EMPTY_BODY);
+    } else {
+      readBody(incoming).then(dispatch, fail);
+    }
   });
   return server;
 }

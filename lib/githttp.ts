@@ -31,14 +31,33 @@ const AGENT = 'forge/1.0';
 
 // ---------------------------------------------------------------- pkt-lines
 
+const HEX_DIGITS = '0123456789abcdef';
+
+/** Write a pkt-line's 4-hex length prefix into `out` at offset 0. */
+function writePktLength(out: Buffer, length: number): void {
+  out[0] = HEX_DIGITS.charCodeAt((length >> 12) & 0xf);
+  out[1] = HEX_DIGITS.charCodeAt((length >> 8) & 0xf);
+  out[2] = HEX_DIGITS.charCodeAt((length >> 4) & 0xf);
+  out[3] = HEX_DIGITS.charCodeAt(length & 0xf);
+}
+
 function pkt(payload: Buffer): Buffer {
+  // One allocation for header + payload (was: a header Buffer, a
+  // toString/padStart, and a concat — three per packet, and receive-pack
+  // plus the advertisements frame a dozen packets per push).
   const length = payload.length + 4;
-  const header = Buffer.from(length.toString(16).padStart(4, '0'), 'ascii');
-  return Buffer.concat([header, payload]);
+  const out = Buffer.allocUnsafe(length);
+  writePktLength(out, length);
+  payload.copy(out, 4);
+  return out;
 }
 
 function pktText(text: string): Buffer {
-  return pkt(Buffer.from(text, 'utf8'));
+  const bodyLength = Buffer.byteLength(text, 'utf8');
+  const out = Buffer.allocUnsafe(bodyLength + 4);
+  writePktLength(out, bodyLength + 4);
+  out.write(text, 4, 'utf8');
+  return out;
 }
 
 const FLUSH = Buffer.from('0000', 'ascii');
@@ -90,11 +109,19 @@ function sidebandPackets(data: Buffer, band: number): Buffer[] {
   const packets: Buffer[] = [];
   const CHUNK = 32768;
   if (data.length === 0) {
-    packets.push(pkt(Buffer.from([band])));
+    const out = Buffer.allocUnsafe(5);
+    writePktLength(out, 5);
+    out[4] = band;
+    packets.push(out);
     return packets;
   }
   for (let offset = 0; offset < data.length; offset += CHUNK) {
-    packets.push(pkt(Buffer.concat([Buffer.from([band]), data.subarray(offset, offset + CHUNK)])));
+    const chunk = Math.min(CHUNK, data.length - offset);
+    const out = Buffer.allocUnsafe(chunk + 5);
+    writePktLength(out, chunk + 5);
+    out[4] = band;
+    data.copy(out, 5, offset, offset + chunk);
+    packets.push(out);
   }
   return packets;
 }
